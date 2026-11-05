@@ -481,6 +481,17 @@ fn q8_dp4a(c: &Ctx) -> Option<&'static (Spv, Spv)> {
         .as_ref()
 }
 
+/// d1 attention (set mask or sliding window) on Xe2's 8×16×16 cooperative
+/// matrices: `d1_attn_coop`, 16 queries × 4 heads sharing a KV head per
+/// workgroup, for 128-dim heads in groups of four.
+fn attn816(c: &Ctx) -> Option<&'static Spv> {
+    static PIPE: std::sync::OnceLock<Option<Spv>> = std::sync::OnceLock::new();
+    PIPE.get_or_init(|| {
+        spv_pipe(c, &super::COOP816_OK, "d1-set-attn", include_bytes!("d1_attn_coop.spv"), 128, &[RO, RO, RO, RW, RO, UNI])
+    })
+    .as_ref()
+}
+
 /// y[k][rows] = x[k][cols] · Wᵀ through the batch graph's kernels.
 fn mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, w: &Proj, xs: &wgpu::Buffer, y: &wgpu::Buffer, k: usize) {
     let (rows, cols) = (w.rows, w.cols);
@@ -810,8 +821,12 @@ pub(crate) fn forward(
                         t as u32,
                     );
                 }
+                let coop_attn = if d.hd == 128 && d.nh == 4 * *nkv { attn816(c) } else { None };
                 let keys = window.map_or(t, |w| w.min(t));
-                let block = (ATTN_PAIRS_PER_SUBMIT / keys).clamp(1, t);
+                let mut block = (ATTN_PAIRS_PER_SUBMIT / keys).clamp(1, t);
+                if coop_attn.is_some() {
+                    block = (block / 16).max(1) * 16;
+                }
                 let mut r0 = 0;
                 while r0 < t {
                     drop(merge_guard);
@@ -822,23 +837,52 @@ pub(crate) fn forward(
                     });
                     merge_guard = PassMergeGuard::new(&enc);
                     let span = block.min(t - r0);
-                    let u = unif(&[
-                        t as u32,
-                        d.nh as u32,
-                        *nkv as u32,
-                        d.hd as u32,
-                        state as u32,
-                        window.unwrap_or(0) as u32,
-                        d.scale.to_bits(),
-                        r0 as u32,
-                    ]);
-                    go(
-                        &mut enc,
-                        &p.attn.p,
-                        &bg(&p.attn.l, &[&x_b, &k_b, &v_b, &a_b, &g_b, &u]),
-                        span as u32,
-                        d.nh as u32,
-                    );
+                    if let Some(cp) = coop_attn {
+                        let u = unif(&[
+                            t as u32,
+                            d.nh as u32,
+                            *nkv as u32,
+                            state as u32,
+                            r0 as u32,
+                            d.scale.to_bits(),
+                            window.unwrap_or(0) as u32,
+                            0,
+                        ]);
+                        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &cp.layout,
+                            entries: &[
+                                bind_buf(0, &x_b),
+                                bind_buf(1, &k_b),
+                                bind_buf(2, &v_b),
+                                bind_buf(3, &a_b),
+                                bind_buf(4, &g_b),
+                                bind_buf(5, &u),
+                            ],
+                        });
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(&cp.pipe);
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.dispatch_workgroups(span.div_ceil(16) as u32, *nkv as u32, 1);
+                    } else {
+                        let u = unif(&[
+                            t as u32,
+                            d.nh as u32,
+                            *nkv as u32,
+                            d.hd as u32,
+                            state as u32,
+                            window.unwrap_or(0) as u32,
+                            d.scale.to_bits(),
+                            r0 as u32,
+                        ]);
+                        go(
+                            &mut enc,
+                            &p.attn.p,
+                            &bg(&p.attn.l, &[&x_b, &k_b, &v_b, &a_b, &g_b, &u]),
+                            span as u32,
+                            d.nh as u32,
+                        );
+                    }
                     r0 += span;
                 }
                 drop(merge_guard);
