@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// x'[m][k] = x[m][k] * colfield[k] of a q8_2f weight, quantized per block of
+// 32 to int8 with one f32 scale: the activation side of the int8 dot-product
+// GEMM (llama.cpp's q8_1 activations, without the sum term the symmetric
+// weight never needs).
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, set = 0, binding = 1) readonly buffer X { vec4 x4[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer QX { uint qx[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer DX { float dx[]; };
+layout(std140, set = 0, binding = 4) uniform P { uint cols4; uint rows; uint nb; uint cols; } p;
+
+void main() {
+    const uint nblk = p.cols / 32;
+    const uint idx = gl_GlobalInvocationID.y * 65535u * 256u + gl_GlobalInvocationID.x;
+    if (idx >= p.nb * nblk) {
+        return;
+    }
+    const uint m = idx / nblk;
+    const uint b = idx % nblk;
+    const uint cs0w = (((p.rows * p.cols) >> 1) + p.rows) >> 1;
+    vec4 v[8];
+    float amax = 0.0;
+    [[unroll]] for (uint i = 0; i < 8; i++) {
+        const uint cw = cs0w + b * 16 + i * 2;
+        const vec4 cf = vec4(unpackHalf2x16(wq[cw]), unpackHalf2x16(wq[cw + 1]));
+        v[i] = x4[m * p.cols4 + b * 8 + i] * cf;
+        amax = max(amax, max(max(abs(v[i].x), abs(v[i].y)), max(abs(v[i].z), abs(v[i].w))));
+    }
+    const float d = amax / 127.0;
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    [[unroll]] for (uint i = 0; i < 8; i++) {
+        const ivec4 q = clamp(ivec4(round(v[i] * inv)), ivec4(-127), ivec4(127));
+        qx[idx * 8 + i] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
+    }
+    dx[idx] = d;
+}
