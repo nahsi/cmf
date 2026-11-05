@@ -53,8 +53,9 @@ fn ls_norm_add_rows(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
 }
 
 // The gated short convolution over `t` positions from an empty ring, one
-// lane a channel: bcx rows [B | C | x] (3h), taps [h][k] with tap k-1 on
-// the current position; y = C·(tap[k-1]·B·x + Σ tap[k-2-s]·ring[s]).
+// lane a (position, channel): bcx rows [B | C | x] (3h), taps [h][k] with
+// tap k-1 on the current position; y = C·Σ_s tap[k-1-s]·(B·x)[r-s], zero
+// before the first position. No recurrence, so every position runs at once.
 struct ScP { h: u32, k: u32, t: u32, pad: u32 };
 @group(0) @binding(0) var<storage, read>       sc_bcx:  array<f32>;
 @group(0) @binding(1) var<storage, read>       sc_taps: array<f32>;
@@ -63,23 +64,18 @@ struct ScP { h: u32, k: u32, t: u32, pad: u32 };
 @compute @workgroup_size(256)
 fn ls_sconv(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ch = gid.x;
+    let r = gid.y;
     let h = sc_p.h;
-    if (ch >= h) { return; }
+    if (ch >= h || r >= sc_p.t) { return; }
     let k = sc_p.k;
-    let rl = k - 1u;
-    var ring: array<f32, 15>;
-    for (var s = 0u; s < 15u; s = s + 1u) { ring[s] = 0.0; }
     let tb = ch * k;
-    for (var r = 0u; r < sc_p.t; r = r + 1u) {
-        let rb = r * 3u * h;
-        let bx = sc_bcx[rb + ch] * sc_bcx[rb + 2u * h + ch];
-        var acc = sc_taps[tb + k - 1u] * bx;
-        for (var s = 0u; s < rl; s = s + 1u) { acc = acc + sc_taps[tb + k - 2u - s] * ring[s]; }
-        sc_y[r * h + ch] = sc_bcx[rb + h + ch] * acc;
-        var j = rl;
-        loop { if (j <= 1u) { break; } ring[j - 1u] = ring[j - 2u]; j = j - 1u; }
-        if (rl > 0u) { ring[0] = bx; }
+    var acc = 0.0;
+    for (var s = 0u; s < k; s = s + 1u) {
+        if (s > r) { break; }
+        let rb = (r - s) * 3u * h;
+        acc = acc + sc_taps[tb + k - 1u - s] * (sc_bcx[rb + ch] * sc_bcx[rb + 2u * h + ch]);
     }
+    sc_y[r * h + ch] = sc_bcx[r * 3u * h + h + ch] * acc;
 }
 
 // Per (head, row): the head's RMS norm (when `hasw`), then RoPE at the
@@ -648,7 +644,7 @@ pub(crate) fn forward(
                     &p.sconv.p,
                     &bg(&p.sconv.l, &[&x_b, &stor(*taps), &a_b, &u]),
                     (hs as u32).div_ceil(256),
-                    1,
+                    t as u32,
                 );
                 mm(c, &mut enc, &pr.mix[1], &a_b, &d_b, t);
             }
