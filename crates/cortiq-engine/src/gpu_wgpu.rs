@@ -21203,6 +21203,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 && c.cr_type == wgpu::CooperativeScalarType::F32
         });
     COOP8_OK.store(want_coop8, std::sync::atomic::Ordering::Relaxed);
+    let want_spv = adapter_info.backend == wgpu::Backend::Vulkan
+        && adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        && std::env::var("CMF_SPV").as_deref() != Ok("0");
+    SPV_OK.store(want_spv, std::sync::atomic::Ordering::Relaxed);
     // Exact-size placement of the big buffers. wgpu's default hint
     // ("Performance") sub-allocates device memory in 128-256 MiB blocks: a
     // 143 MiB packed expert plane takes a block of its own and strands the
@@ -21225,6 +21229,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::Features::empty()
         } | if want_coop || want_coop8 {
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+        } else {
+            wgpu::Features::empty()
+        } | if want_spv {
+            wgpu::Features::PASSTHROUGH_SHADERS
         } else {
             wgpu::Features::empty()
         } | if want_f16 {
@@ -47577,6 +47585,8 @@ pub(crate) fn pco() -> wgpu::PipelineCompilationOptions<'static> {
 static COOP_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Apple's 8×8×8 f16→f32 cooperative matrices (Metal), where 16×16 is absent.
 static COOP8_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Vulkan SPIR-V passthrough: hand-written GLSL kernels (`gpu_wgpu/*.comp`).
+static SPV_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn coop_matrix_active() -> bool {
     COOP_OK.load(std::sync::atomic::Ordering::Relaxed)

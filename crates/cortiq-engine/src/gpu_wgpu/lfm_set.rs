@@ -387,6 +387,96 @@ fn resolve(c: &Ctx, model: &Arc<CmfModel>, w: SetW) -> Option<Proj> {
     Some(Proj { w, rows, cols })
 }
 
+/// A hand-written SPIR-V kernel (GLSL in `gpu_wgpu/*.comp`, compiled with
+/// `glslc --target-env=vulkan1.3 -O` into the committed `.spv` beside it)
+/// behind an explicit bind group layout.
+struct Spv {
+    pipe: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+fn spv_pipe(
+    c: &Ctx,
+    gate: &std::sync::atomic::AtomicBool,
+    label: &str,
+    spv: &[u8],
+    bindings: &[wgpu::BufferBindingType],
+) -> Option<Spv> {
+    if !gate.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
+        .iter()
+        .enumerate()
+        .map(|(i, &ty)| wgpu::BindGroupLayoutEntry {
+            binding: i as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        })
+        .collect();
+    let layout = c.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &entries,
+    });
+    let pl = c.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let words: Vec<u32> = spv
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = unsafe {
+        c.device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+            label: Some(label),
+            entry_points: std::borrow::Cow::Owned(vec![wgpu::PassthroughShaderEntryPoint {
+                name: "main".into(),
+                workgroup_size: (128, 1, 1),
+            }]),
+            spirv: Some(std::borrow::Cow::Owned(words)),
+            ..Default::default()
+        })
+    };
+    let pipe = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pl),
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        tracing::warn!("{label} rejected ({e}); the WGSL kernel stays");
+        return None;
+    }
+    tracing::info!("{label}: SPIR-V kernel on");
+    Some(Spv { pipe, layout })
+}
+
+const RO: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: true };
+const RW: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: false };
+const UNI: wgpu::BufferBindingType = wgpu::BufferBindingType::Uniform;
+
+/// The q8_2f GEMM as int8 dot products: activations times the column field,
+/// quantized per 32-block (`d1_q8_quant`), then `d1_q8_dp4a`.
+fn q8_dp4a(c: &Ctx) -> Option<&'static (Spv, Spv)> {
+    static PIPES: std::sync::OnceLock<Option<(Spv, Spv)>> = std::sync::OnceLock::new();
+    PIPES
+        .get_or_init(|| {
+            let quant = spv_pipe(c, &super::SPV_OK, "d1-q8-quant", include_bytes!("d1_q8_quant.spv"), &[RO, RO, RW, RW, UNI])?;
+            let gemm = spv_pipe(c, &super::SPV_OK, "d1-q8-dp4a", include_bytes!("d1_q8_dp4a.spv"), &[RO, RO, RO, RW, UNI])?;
+            Some((quant, gemm))
+        })
+        .as_ref()
+}
+
 /// y[k][rows] = x[k][cols] · Wᵀ through the batch graph's kernels.
 fn mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, w: &Proj, xs: &wgpu::Buffer, y: &wgpu::Buffer, k: usize) {
     let (rows, cols) = (w.rows, w.cols);
@@ -420,6 +510,35 @@ fn mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, w: &Proj, xs: &wgpu::Buffer, y: &
             }
         }
         W::Q8(b) => {
+            if k > 16 && rows % 128 == 0 && cols % 32 == 0 {
+                if let Some((quant, gemm)) = q8_dp4a(c) {
+                    let nblk = cols / 32;
+                    let qx = scratch(c, 12, k * cols, wgpu::BufferUsages::STORAGE);
+                    let dx = scratch(c, 13, k * nblk * 4, wgpu::BufferUsages::STORAGE);
+                    let u = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, cols as u32]);
+                    let bq = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &quant.layout,
+                        entries: &[bind_buf(0, b), bind_buf(1, xs), bind_buf(2, &qx), bind_buf(3, &dx), bind_buf(4, &u)],
+                    });
+                    let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &gemm.layout,
+                        entries: &[bind_buf(0, b), bind_buf(1, &qx), bind_buf(2, &dx), bind_buf(3, y), bind_buf(4, &u)],
+                    });
+                    let groups = ((k * nblk) as u32).div_ceil(256);
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(&quant.pipe);
+                    pass.set_bind_group(0, &bq, &[]);
+                    pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+                    drop(pass);
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(&gemm.pipe);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups((rows / 128) as u32, k.div_ceil(128) as u32, 1);
+                    return;
+                }
+            }
             if k > 16
                 && gemma_batch::pipes(c)
                     .is_some_and(|gp| gemma_batch::encode_q82_mm(c, enc, gp, b, xs, y, rows, cols, k))

@@ -1,0 +1,124 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
+
+// y[nb][rows] = rowscale[n] * sum_b dx[m][b] * <q[n][b], qx[m][b]>: the
+// q8_2f GEMM as int8 dot products over 32-wide blocks, the arm llama.cpp
+// runs Q8_0 on for Intel GPUs. A workgroup computes BM weight rows by BN
+// tokens; each thread a TM x TN register tile with rows strided by BM / TM
+// and tokens by BN / TN. Defaults: the fastest of a sweep on an Arc Pro B50
+// (Xe2, Mesa ANV) at 7680x2048x3499, 9.8 TFLOPS with the quantize pass.
+#ifndef BM
+#define BM 128
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#ifndef TM
+#define TM 4
+#endif
+#ifndef TN
+#define TN 8
+#endif
+#ifndef NT
+#define NT 512
+#endif
+#ifndef PADW
+#define PADW 1
+#endif
+#ifndef KS
+#define KS 1
+#endif
+
+const uint RS = BM / TM;
+const uint CS = BN / TN;
+const uint LDW = 8 + PADW;
+
+layout(local_size_x = NT) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Wq { uint wq[]; };
+layout(std430, set = 0, binding = 1) readonly buffer QX { uint qx[]; };
+layout(std430, set = 0, binding = 2) readonly buffer DX { float dx[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Y { float y[]; };
+layout(std140, set = 0, binding = 4) uniform P { uint cols4; uint rows; uint nb; uint cols; } p;
+
+shared uint As[KS * BM * LDW];
+shared uint Bs[KS * BN * LDW];
+shared float Bd[KS * BN];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint n0 = gl_WorkGroupID.x * BM;
+    const uint m0 = gl_WorkGroupID.y * BN;
+    const uint tr = tid % RS;
+    const uint tc = tid / RS;
+    const uint nblk = p.cols / 32;
+    const uint rs0 = (p.rows * p.cols) >> 2;
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0; i < TM; i++) {
+        [[unroll]] for (uint j = 0; j < TN; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint kb0 = 0; kb0 < nblk; kb0 += KS) {
+        [[unroll]] for (uint s = 0; s < (KS * BM * 8) / NT; s++) {
+            const uint i = tid + s * NT;
+            const uint r = i / (8 * KS);
+            const uint q = i % (8 * KS);
+            const uint k = q / 8;
+            const uint w = q % 8;
+            As[(k * BM + r) * LDW + w] = kb0 + k < nblk ? wq[(n0 + r) * (p.cols / 4) + (kb0 + k) * 8 + w] : 0u;
+        }
+        [[unroll]] for (uint s = 0; s < (KS * BN * 8) / NT; s++) {
+            const uint i = tid + s * NT;
+            const uint c = i / (8 * KS);
+            const uint q = i % (8 * KS);
+            const uint k = q / 8;
+            const uint w = q % 8;
+            const bool live = m0 + c < p.nb && kb0 + k < nblk;
+            Bs[(k * BN + c) * LDW + w] = live ? qx[((m0 + c) * nblk + kb0 + k) * 8 + w] : 0u;
+            if (w == 0) {
+                Bd[k * BN + c] = live ? dx[(m0 + c) * nblk + kb0 + k] : 0.0;
+            }
+        }
+        barrier();
+        [[unroll]] for (uint k = 0; k < KS; k++) {
+            int a[TM][8];
+            [[unroll]] for (uint i = 0; i < TM; i++) {
+                [[unroll]] for (uint w = 0; w < 8; w++) {
+                    a[i][w] = int(As[(k * BM + tr + i * RS) * LDW + w]);
+                }
+            }
+            [[unroll]] for (uint j = 0; j < TN; j++) {
+                const uint c = tc + j * CS;
+                int b[8];
+                [[unroll]] for (uint w = 0; w < 8; w++) {
+                    b[w] = int(Bs[(k * BN + c) * LDW + w]);
+                }
+                const float d = Bd[k * BN + c];
+                [[unroll]] for (uint i = 0; i < TM; i++) {
+                    int s = 0;
+                    [[unroll]] for (uint w = 0; w < 8; w++) {
+                        s += dotPacked4x8EXT(a[i][w], b[w]);
+                    }
+                    acc[i][j] += float(s) * d;
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; i++) {
+        const uint r = n0 + tr + i * RS;
+        const vec2 r2 = unpackHalf2x16(wq[rs0 + (r >> 1)]);
+        const float rs = (r & 1) == 0 ? r2.x : r2.y;
+        [[unroll]] for (uint j = 0; j < TN; j++) {
+            const uint c = m0 + tc + j * CS;
+            if (c < p.nb) {
+                y[c * p.rows + r] = acc[i][j] * rs;
+            }
+        }
+    }
+}
