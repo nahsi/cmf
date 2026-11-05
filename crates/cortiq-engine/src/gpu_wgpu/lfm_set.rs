@@ -1,10 +1,10 @@
 //! d1's one-pass forward on wgpu (`pipeline_masked::forward_masked`), the
 //! twin of `gpu_metal::lfm_set`: each layer of an LFM3 stack over the whole
-//! packed row in its own submission, completed before the next layer to
-//! bound GPU jobs. Uses the batch graph's q4tp / q8_2f GEMMs, the short
-//! convolution walked over the positions from an empty ring, Q/K norm +
-//! RoPE per row, the `set` attention (or causal within a sliding window)
-//! and the per-head sigmoid gate.
+//! packed row in its own submission and its attention in blocks of query
+//! rows, so no GPU job outgrows a driver watchdog. Uses the batch graph's
+//! q4tp / q8_2f GEMMs, the short convolution walked over the positions from
+//! an empty ring, Q/K norm + RoPE per row, the `set` attention (or causal
+//! within a sliding window) and the per-head sigmoid gate.
 //!
 //! No subgroup operations: every reduction goes through workgroup memory,
 //! so the module compiles on every adapter the engine runs.
@@ -463,8 +463,9 @@ fn scratch(c: &Ctx, role: u8, bytes: usize, usage: wgpu::BufferUsages) -> wgpu::
     b
 }
 
-/// Query-row × key pairs per attention submission: about one second on an
-/// Arc Pro B50, well inside the 5 s xe job watchdog.
+/// Query-row × key pairs per attention submission at d1's 16 query heads of
+/// 128 dims: about one second on an Arc Pro B50, well inside the 5 s xe job
+/// watchdog.
 const ATTN_PAIRS_PER_SUBMIT: usize = 1 << 25;
 
 /// The final-normed hidden rows `[t, hidden]` of `rows` under d1's mask
@@ -694,7 +695,14 @@ pub(crate) fn forward(
                 let block = (ATTN_PAIRS_PER_SUBMIT / keys).clamp(1, t);
                 let mut r0 = 0;
                 while r0 < t {
-                    let rows = block.min(t - r0);
+                    drop(merge_guard);
+                    submit(c, finish_enc(enc));
+                    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                    enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("d1-set-attn"),
+                    });
+                    merge_guard = PassMergeGuard::new(&enc);
+                    let span = block.min(t - r0);
                     let u = unif(&[
                         t as u32,
                         d.nh as u32,
@@ -709,22 +717,18 @@ pub(crate) fn forward(
                         &mut enc,
                         &p.attn.p,
                         &bg(&p.attn.l, &[&x_b, &k_b, &v_b, &a_b, &g_b, &u]),
-                        rows as u32,
+                        span as u32,
                         d.nh as u32,
                     );
-                    r0 += rows;
-                    if r0 < t {
-                        drop(merge_guard);
-                        submit(c, finish_enc(enc));
-                        c.device
-                            .poll(wgpu::PollType::wait_indefinitely())
-                            .expect("d1 attention submission failed");
-                        enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("d1-set-attn"),
-                        });
-                        merge_guard = PassMergeGuard::new(&enc);
-                    }
+                    r0 += span;
                 }
+                drop(merge_guard);
+                submit(c, finish_enc(enc));
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("d1-set-layer"),
+                });
+                merge_guard = PassMergeGuard::new(&enc);
                 if let Some(gw) = head_gate {
                     let u = unif(&[d.nh as u32, d.hd as u32, hs as u32, 0]);
                     go(
@@ -751,9 +755,7 @@ pub(crate) fn forward(
         norm_add(&mut enc, &d_b, l.ffn_out_norm);
         drop(merge_guard);
         submit(c, finish_enc(enc));
-        c.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("d1 layer submission failed");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("d1-set"),
