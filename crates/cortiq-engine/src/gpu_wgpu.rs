@@ -21267,7 +21267,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("request_device: {e}"))?;
-    device.set_device_lost_callback(move |reason, message| {
+    device.set_device_lost_callback(|reason, message| {
         if reason != wgpu::DeviceLostReason::Destroyed {
             tracing::error!(?reason, %message, "GPU device lost; terminating process");
             std::process::abort();
