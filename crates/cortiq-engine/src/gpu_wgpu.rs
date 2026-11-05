@@ -21207,8 +21207,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
         && adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS)
         && std::env::var("CMF_SPV").as_deref() != Ok("0");
     SPV_OK.store(want_spv, std::sync::atomic::Ordering::Relaxed);
-    let want_coop816 = !want_coop
-        && want_spv
+    let want_coop816 = want_spv
+        && (8..=32).contains(&adapter_info.subgroup_min_size)
+        && (8..=32).contains(&adapter_info.subgroup_max_size)
         && adapter.features().contains(
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
         )

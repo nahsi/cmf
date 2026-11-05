@@ -43,6 +43,7 @@ shared float Ss[ROWS * BC];
 shared float16_t Ps[ROWS * BC];
 shared float rowm[ROWS];
 shared float rowl[ROWS];
+shared int rowg[ROWS];
 shared int gk[BC];
 
 void stage_kv(uint kb, uint g, bool is_v) {
@@ -122,6 +123,7 @@ void main() {
     if (tid < ROWS) {
         my_i = q0 + (tid % QB);
         my_g = grp[min(my_i, p.t - 1)];
+        rowg[tid] = my_g;
         rowm[tid] = -3.0e38;
         rowl[tid] = 0.0;
     }
@@ -159,8 +161,9 @@ void main() {
     }
 
     // The 64x128 output split tile by tile over the subgroups, whatever
-    // width ANV dispatches at (SIMD32 on Xe2: 16 tiles each). A fixed
-    // per-subgroup layout measured slower on the B50.
+    // width ANV dispatches at (SIMD32 on Xe2: 16 tiles each). Subgroups of
+    // 8 to 32 lanes (the gate in gpu_wgpu.rs) keep tps within acc[16]. A
+    // fixed per-subgroup layout measured slower on the B50.
     const uint otiles = (ROWS / 8) * (HD / 16);
     const uint tps = otiles / nsg;
     coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[16];
@@ -177,7 +180,7 @@ void main() {
             const uint r = e / BC;
             const uint c = e % BC;
             const uint i = q0 + (r % QB);
-            const int gi = grp[min(i, p.t - 1)];
+            const int gi = rowg[r];
             float pr = 0.0;
             if (visible(i, gi, kb + c, c)) {
                 pr = exp(Ss[e] * p.scale - rowm[r]) / rowl[r];
