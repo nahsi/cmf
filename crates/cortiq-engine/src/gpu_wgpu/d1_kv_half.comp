@@ -1,0 +1,24 @@
+#version 450
+
+// K and V of one attention layer as f16 pairs for `d1_attn_coop`, padded
+// past t with zeros so its last key block reads no stale rows.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer K { vec2 k[]; };
+layout(std430, set = 0, binding = 1) readonly buffer V { vec2 v[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer K16 { uint k16[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer V16 { uint v16[]; };
+layout(std140, set = 0, binding = 4) uniform P {
+    uint n;
+    uint total;
+    uint stride;
+    uint pad;
+} p;
+
+void main() {
+    for (uint i = gl_GlobalInvocationID.x; i < p.total; i += p.stride) {
+        const bool live = i < p.n;
+        k16[i] = live ? packHalf2x16(k[i]) : 0u;
+        v16[i] = live ? packHalf2x16(v[i]) : 0u;
+    }
+}
