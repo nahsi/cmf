@@ -73,7 +73,7 @@ fn ls_sconv(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var s = 0u; s < k; s = s + 1u) {
         if (s > r) { break; }
         let rb = (r - s) * 3u * h;
-        acc = acc + sc_taps[tb + k - 1u - s] * sc_bcx[rb + ch] * sc_bcx[rb + 2u * h + ch];
+        acc = acc + sc_taps[tb + k - 1u - s] * (sc_bcx[rb + ch] * sc_bcx[rb + 2u * h + ch]);
     }
     sc_y[r * h + ch] = sc_bcx[r * 3u * h + h + ch] * acc;
 }
