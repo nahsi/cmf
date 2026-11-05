@@ -52,7 +52,8 @@ impl Pipeline {
         if t == 0 || rows.len() != t * hs || mask.group.len() != t || mask.state > t {
             return Err("masked forward: rows, groups and state length disagree".into());
         }
-        if let Some((hidden, mut logits)) = self.forward_masked_device(rows, t, mask, head_rows) {
+        if let Some(device) = self.forward_masked_device(rows, t, mask, head_rows) {
+            let (hidden, mut logits) = device?;
             let v = self.vocab_size;
             if head_rows.is_empty() {
                 return Ok((hidden, Vec::new()));
@@ -150,16 +151,15 @@ impl Pipeline {
         Ok(normed)
     }
 
-    /// The same forward on the device in one submission
-    /// (`gpu::lfm_set_forward`), or None: a stack or weight outside its
-    /// kernels, no device, or `CMF_D1_DEVICE=0`.
+    /// The same forward on the device (`gpu::lfm_set_forward`), or None: a
+    /// stack or weight outside its kernels, no device, or `CMF_D1_DEVICE=0`.
     fn forward_masked_device(
         &self,
         rows: &[f32],
         t: usize,
         mask: &SetMask,
         head_rows: &[usize],
-    ) -> Option<(Vec<f32>, Vec<f32>)> {
+    ) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
         use crate::gpu::{SetDims, SetHead, SetLayer, SetMixer};
         if std::env::var("CMF_D1_DEVICE").as_deref() == Ok("0") || !crate::gpu::enabled_here() {
             return None;

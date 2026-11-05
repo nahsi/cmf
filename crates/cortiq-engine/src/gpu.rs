@@ -4641,7 +4641,8 @@ pub struct SetHead<'a> {
 /// d1's `set` forward on the device: the final-normed hidden rows `[t,
 /// hidden]` of the embedding rows `rows` and, with `head`, the logits
 /// `[head.rows, vocab]` of its rows (empty without), or None when the
-/// backend or a weight is outside the kernels (the host path answers).
+/// backend or a weight is outside the kernels (the host path answers). An
+/// error is a row the device cannot dispatch or hold.
 #[allow(clippy::too_many_arguments, unused_variables)]
 pub fn lfm_set_forward(
     model: &Arc<CmfModel>,
@@ -4653,13 +4654,14 @@ pub fn lfm_set_forward(
     state: usize,
     group: &[i32],
     head: Option<&SetHead>,
-) -> Option<(Vec<f32>, Vec<f32>)> {
+) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
     #[allow(unreachable_patterns)]
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::lfm_set::forward(
             model, layers, dims, final_norm, rows, t, state, group, head,
-        ),
+        )
+        .map(Ok),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::lfm_set::forward(
             model, layers, dims, final_norm, rows, t, state, group, head,

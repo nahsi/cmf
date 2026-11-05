@@ -575,9 +575,10 @@ fn mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, w: &Proj, xs: &wgpu::Buffer, y: &
     }
 }
 
+static SCR: std::sync::Mutex<Vec<(u8, wgpu::Buffer)>> = std::sync::Mutex::new(Vec::new());
+
 /// A grow-only scratch buffer per role (the call's sizes vary).
 fn scratch(c: &Ctx, role: u8, bytes: usize, usage: wgpu::BufferUsages) -> wgpu::Buffer {
-    static SCR: std::sync::Mutex<Vec<(u8, wgpu::Buffer)>> = std::sync::Mutex::new(Vec::new());
     let mut m = SCR.lock().unwrap();
     if let Some((_, b)) = m.iter().find(|(r, b)| *r == role && b.size() >= bytes as u64) {
         return b.clone();
@@ -598,9 +599,14 @@ fn scratch(c: &Ctx, role: u8, bytes: usize, usage: wgpu::BufferUsages) -> wgpu::
 /// watchdog.
 const ATTN_PAIRS_PER_SUBMIT: usize = 1 << 25;
 
+/// Rows of the FFN per pass, so its `inter`-wide activations cost a chunk
+/// rather than the whole row: at 32K rows they were 3 GB of an 8 GB card.
+const FFN_ROWS: usize = 2048;
+
 /// The final-normed hidden rows `[t, hidden]` of `rows` under d1's mask
 /// and, with `head`, the logits of its rows; None when the stack or a
-/// weight is outside these kernels.
+/// weight is outside these kernels, an error when the row is longer than
+/// the device can dispatch or hold.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(
     model: &Arc<CmfModel>,
@@ -612,12 +618,11 @@ pub(crate) fn forward(
     state: usize,
     group: &[i32],
     head: Option<&SetHead>,
-) -> Option<(Vec<f32>, Vec<f32>)> {
+) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
     let c = ctx()?;
     let p = pipes(c)?;
     let hs = d.hidden;
     if t < 8
-        || t > 32768
         || rows.len() != t * hs
         || group.len() != t
         || state > t
@@ -709,7 +714,7 @@ pub(crate) fn forward(
         };
         preps.push(Prep { mix, ffn });
     }
-    let wide = wide.max(inter_max);
+    let aw = hs.max(d.nh * d.hd);
     let head = match head {
         Some(hd) if !hd.rows.is_empty() => {
             let w = resolve(c, model, hd.w)?;
@@ -720,21 +725,65 @@ pub(crate) fn forward(
         }
         _ => None,
     };
+    let lim = c.device.limits();
+    let max_t = (lim.max_compute_workgroups_per_dimension as usize)
+        .min((lim.max_storage_buffer_binding_size / (wide as u64 * 4)) as usize);
+    if t > max_t {
+        return Some(Err(format!("d1 input of {t} tokens is over this GPU's limit of {max_t}")));
+    }
 
     use wgpu::BufferUsages as U;
     let st = U::STORAGE | U::COPY_DST | U::COPY_SRC;
+    let ch = FFN_ROWS.min(t);
+    let oom = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let h_b = scratch(c, 1, t * hs * 4, st);
     let n_b = scratch(c, 2, t * hs * 4, st);
     let d_b = scratch(c, 3, t * hs * 4, st);
     let x_b = scratch(c, 4, t * wide * 4, st);
-    let u_b = scratch(c, 5, t * inter_max.max(d.nh * d.hd) * 4, st);
     let k_b = scratch(c, 6, t * kv_max * 4, st);
     let v_b = scratch(c, 7, t * kv_max * 4, st);
-    let a_b = scratch(c, 8, t * wide * 4, st);
+    let a_b = scratch(c, 8, t * aw * 4, st);
     let g_b = scratch(c, 9, t * 4, st);
     let staging = scratch(c, 10, t * hs * 4, U::MAP_READ | U::COPY_DST);
+    let f_in = scratch(c, 5, ch * hs * 4, st);
+    let f_gate = scratch(c, 14, ch * inter_max * 4, st);
+    let f_up = scratch(c, 15, ch * inter_max * 4, st);
+    let f_act = scratch(c, 16, ch * inter_max * 4, st);
+    let f_out = scratch(c, 17, ch * hs * 4, st);
+    if q8_dp4a(c).is_some() {
+        let q = (t * aw).max(ch * inter_max);
+        scratch(c, 12, q, U::STORAGE);
+        scratch(c, 13, q / 32 * 4, U::STORAGE);
+    }
+    let head_bufs = head.as_ref().map(|(w, idx)| {
+        let bytes = idx.len() * w.rows * 4;
+        (scratch(c, 11, bytes, st), scratch(c, 18, bytes, U::MAP_READ | U::COPY_DST))
+    });
+    if let Some(e) = pollster::block_on(oom.pop()) {
+        SCR.lock().unwrap().clear();
+        return Some(Err(format!("d1 input of {t} tokens does not fit in GPU memory: {e}")));
+    }
     c.queue.write_buffer(&h_b, 0, bytemuck::cast_slice(rows));
     c.queue.write_buffer(&g_b, 0, bytemuck::cast_slice(group));
+    if let Some(r) = c.device.generate_allocator_report() {
+        let mut a: Vec<_> = r.allocations.iter().map(|x| (x.size, x.name.clone())).collect();
+        a.sort_by(|x, y| y.0.cmp(&x.0));
+        let mut by: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
+        for (s, n) in &a {
+            let e = by.entry(n.clone()).or_default();
+            e.0 += s;
+            e.1 += 1;
+        }
+        let mut byv: Vec<_> = by.into_iter().collect();
+        byv.sort_by(|x, y| y.1.0.cmp(&x.1.0));
+        tracing::info!(
+            "PRIMESTACK-MEM t={t} allocated={} reserved={} n={} top={:?}",
+            r.total_allocated_bytes >> 20,
+            r.total_reserved_bytes >> 20,
+            a.len(),
+            byv.iter().take(15).map(|(n, (s, k))| format!("{n}:{}MiB/{k}", s >> 20)).collect::<Vec<_>>()
+        );
+    }
 
     let stor = |data: &[f32]| const_buf(c, bytemuck::cast_slice(data));
     let dummy = stor(&[0f32; 4]);
@@ -908,13 +957,23 @@ pub(crate) fn forward(
         norm_add(&mut enc, &d_b, l.attn_out_norm);
         rms(&mut enc, &h_b, l.post_norm, &n_b);
         let inter = pr.ffn[0].rows;
-        mm(c, &mut enc, &pr.ffn[0], &n_b, &x_b, t);
-        mm(c, &mut enc, &pr.ffn[1], &n_b, &u_b, t);
-        let n = (t * inter) as u32;
-        let groups = n.div_ceil(256).min(4096);
-        let u = unif(&[n, groups * 256, 0, 0]);
-        go(&mut enc, &p.silu_mul.p, &bg(&p.silu_mul.l, &[&x_b, &u_b, &a_b, &u]), groups, 1);
-        mm(c, &mut enc, &pr.ffn[2], &a_b, &d_b, t);
+        let mut r0 = 0;
+        while r0 < t {
+            let n_rows = ch.min(t - r0);
+            let (off, len) = ((r0 * hs * 4) as u64, (n_rows * hs * 4) as u64);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&n_b, off, &f_in, 0, len);
+            mm(c, &mut enc, &pr.ffn[0], &f_in, &f_gate, n_rows);
+            mm(c, &mut enc, &pr.ffn[1], &f_in, &f_up, n_rows);
+            let n = (n_rows * inter) as u32;
+            let groups = n.div_ceil(256).min(4096);
+            let u = unif(&[n, groups * 256, 0, 0]);
+            go(&mut enc, &p.silu_mul.p, &bg(&p.silu_mul.l, &[&f_gate, &f_up, &f_act, &u]), groups, 1);
+            mm(c, &mut enc, &pr.ffn[2], &f_act, &f_out, n_rows);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&f_out, 0, &d_b, off, len);
+            r0 += n_rows;
+        }
         norm_add(&mut enc, &d_b, l.ffn_out_norm);
         drop(merge_guard);
         submit(c, finish_enc(enc));
@@ -926,9 +985,9 @@ pub(crate) fn forward(
     let _merge_guard = PassMergeGuard::new(&enc);
     rms(&mut enc, &h_b, final_norm, &n_b);
     let mut out = vec![0f32; t * hs];
-    let Some((w, idx)) = &head else {
-        return readback(c, enc, &n_b, &staging, (t * hs * 4) as u64, &mut out)
-            .then_some((out, Vec::new()));
+    let out_bytes = (t * hs * 4) as u64;
+    let (Some((w, idx)), Some((lb, l_stage))) = (&head, &head_bufs) else {
+        return readback(c, enc, &n_b, &staging, out_bytes, &mut out).then(|| Ok((out, Vec::new())));
     };
     let nb = idx.len();
     let ib = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -944,8 +1003,12 @@ pub(crate) fn forward(
         (hs as u32).div_ceil(256),
         nb as u32,
     );
-    let lb = scratch(c, 11, nb * w.rows * 4, st);
-    mm(c, &mut enc, w, &d_b, &lb, nb);
+    mm(c, &mut enc, w, &d_b, lb, nb);
     let mut logits = vec![0f32; nb * w.rows];
-    readback2(c, enc, (&n_b, &mut out), (&lb, &mut logits)).then_some((out, logits))
+    let l_enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("d1-set-logits"),
+    });
+    let ok = readback(c, enc, &n_b, &staging, out_bytes, &mut out)
+        && readback(c, l_enc, lb, l_stage, (logits.len() * 4) as u64, &mut logits);
+    ok.then(|| Ok((out, logits)))
 }
