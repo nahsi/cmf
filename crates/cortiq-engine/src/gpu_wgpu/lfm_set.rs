@@ -726,15 +726,16 @@ pub(crate) fn forward(
         _ => None,
     };
     let lim = c.device.limits();
-    let max_t = (lim.max_compute_workgroups_per_dimension as usize)
-        .min((lim.max_storage_buffer_binding_size / (wide as u64 * 4)) as usize);
+    let max_t = (lim.max_compute_workgroups_per_dimension as usize).min(
+        (lim.max_storage_buffer_binding_size.min(lim.max_buffer_size) / (wide as u64 * 4)) as usize,
+    );
     if t > max_t {
         return Some(Err(format!("d1 input of {t} tokens is over this GPU's limit of {max_t}")));
     }
 
     use wgpu::BufferUsages as U;
     let st = U::STORAGE | U::COPY_DST | U::COPY_SRC;
-    let ch = FFN_ROWS.min(t);
+    let ch = t.div_ceil(t.div_ceil(FFN_ROWS));
     let oom = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let h_b = scratch(c, 1, t * hs * 4, st);
     let n_b = scratch(c, 2, t * hs * 4, st);
@@ -759,12 +760,12 @@ pub(crate) fn forward(
         let bytes = idx.len() * w.rows * 4;
         (scratch(c, 11, bytes, st), scratch(c, 18, bytes, U::MAP_READ | U::COPY_DST))
     });
+    c.queue.write_buffer(&h_b, 0, bytemuck::cast_slice(rows));
+    c.queue.write_buffer(&g_b, 0, bytemuck::cast_slice(group));
     if let Some(e) = pollster::block_on(oom.pop()) {
         SCR.lock().unwrap().clear();
         return Some(Err(format!("d1 input of {t} tokens does not fit in GPU memory: {e}")));
     }
-    c.queue.write_buffer(&h_b, 0, bytemuck::cast_slice(rows));
-    c.queue.write_buffer(&g_b, 0, bytemuck::cast_slice(group));
 
     let stor = |data: &[f32]| const_buf(c, bytemuck::cast_slice(data));
     let dummy = stor(&[0f32; 4]);
