@@ -388,7 +388,7 @@ fn resolve(c: &Ctx, model: &Arc<CmfModel>, w: SetW) -> Option<Proj> {
 }
 
 /// A hand-written SPIR-V kernel (GLSL in `gpu_wgpu/*.comp`, compiled with
-/// `glslc --target-env=vulkan1.3 -O` into the committed `.spv` beside it)
+/// `glslc --target-env=vulkan1.2 -O` into the committed `.spv` beside it)
 /// behind an explicit bind group layout.
 struct Spv {
     pipe: wgpu::ComputePipeline,
@@ -400,6 +400,7 @@ fn spv_pipe(
     gate: &std::sync::atomic::AtomicBool,
     label: &str,
     spv: &[u8],
+    workgroup: u32,
     bindings: &[wgpu::BufferBindingType],
 ) -> Option<Spv> {
     if !gate.load(std::sync::atomic::Ordering::Relaxed) {
@@ -432,13 +433,14 @@ fn spv_pipe(
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = unsafe {
         c.device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
             label: Some(label),
             entry_points: std::borrow::Cow::Owned(vec![wgpu::PassthroughShaderEntryPoint {
                 name: "main".into(),
-                workgroup_size: (128, 1, 1),
+                workgroup_size: (workgroup, 1, 1),
             }]),
             spirv: Some(std::borrow::Cow::Owned(words)),
             ..Default::default()
@@ -450,9 +452,11 @@ fn spv_pipe(
         module: &module,
         entry_point: Some("main"),
         compilation_options: Default::default(),
-        cache: None,
+        cache: c.pipeline_cache.as_ref(),
     });
-    if let Some(e) = pollster::block_on(scope.pop()) {
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
         tracing::warn!("{label} rejected ({e}); the WGSL kernel stays");
         return None;
     }
@@ -470,8 +474,8 @@ fn q8_dp4a(c: &Ctx) -> Option<&'static (Spv, Spv)> {
     static PIPES: std::sync::OnceLock<Option<(Spv, Spv)>> = std::sync::OnceLock::new();
     PIPES
         .get_or_init(|| {
-            let quant = spv_pipe(c, &super::SPV_OK, "d1-q8-quant", include_bytes!("d1_q8_quant.spv"), &[RO, RO, RW, RW, UNI])?;
-            let gemm = spv_pipe(c, &super::SPV_OK, "d1-q8-dp4a", include_bytes!("d1_q8_dp4a.spv"), &[RO, RO, RO, RW, UNI])?;
+            let quant = spv_pipe(c, &super::SPV_OK, "d1-q8-quant", include_bytes!("d1_q8_quant.spv"), 256, &[RO, RO, RW, RW, UNI])?;
+            let gemm = spv_pipe(c, &super::SPV_OK, "d1-q8-dp4a", include_bytes!("d1_q8_dp4a.spv"), 512, &[RO, RO, RO, RW, UNI])?;
             Some((quant, gemm))
         })
         .as_ref()

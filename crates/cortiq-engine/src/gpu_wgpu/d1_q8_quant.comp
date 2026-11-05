@@ -31,7 +31,7 @@ void main() {
         amax = max(amax, max(max(abs(v[i].x), abs(v[i].y)), max(abs(v[i].z), abs(v[i].w))));
     }
     const float d = amax / 127.0;
-    const float inv = d > 0.0 ? 1.0 / d : 0.0;
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
     [[unroll]] for (uint i = 0; i < 8; i++) {
         const ivec4 q = clamp(ivec4(round(v[i] * inv)), ivec4(-127), ivec4(127));
         qx[idx * 8 + i] = uint(q.x & 0xff) | (uint(q.y & 0xff) << 8) | (uint(q.z & 0xff) << 16) | (uint(q.w & 0xff) << 24);
