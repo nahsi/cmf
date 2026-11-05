@@ -1,10 +1,10 @@
 //! d1's one-pass forward on wgpu (`pipeline_masked::forward_masked`), the
-//! twin of `gpu_metal::lfm_set`: every layer of an LFM3 stack over the whole
-//! packed row in one submission — the batch graph's q4tp / q8_2f GEMMs, the
-//! short convolution walked over the positions from an empty ring, Q/K norm
-//! + RoPE per row, the `set` attention (or causal within a sliding window)
-//! and the per-head sigmoid gate. The host path ran each projection as its
-//! own submission: ~0.7 s for a 228-token request on an A40.
+//! twin of `gpu_metal::lfm_set`: each layer of an LFM3 stack over the whole
+//! packed row in its own submission and its attention in blocks of query
+//! rows, so no GPU job outgrows a driver watchdog. Uses the batch graph's
+//! q4tp / q8_2f GEMMs, the short convolution walked over the positions from
+//! an empty ring, Q/K norm + RoPE per row, the `set` attention (or causal
+//! within a sliding window) and the per-head sigmoid gate.
 //!
 //! No subgroup operations: every reduction goes through workgroup memory,
 //! so the module compiles on every adapter the engine runs.
@@ -133,12 +133,12 @@ fn ls_qk_rope(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     loop { if (d >= hd) { break; } qr_x[base + d] = qr_a[d]; d = d + 32u; }
 }
 
-// Attention of row i (wid.x), head hh (wid.y) over the packed row: online
+// Attention of row r0 + wid.x, head hh (wid.y) over the packed row: online
 // softmax in 128-key blocks, one key a lane for the scores, one dim a lane
 // for P·V. `window` 0: d1's `set` mask (the state reads every row and is
 // read by every row; a question row reads its own question); otherwise
 // causal within the window. hd ≤ 256.
-struct AtP { t: u32, nh: u32, nkv: u32, hd: u32, state: u32, window: u32, scale: f32, pad: u32 };
+struct AtP { t: u32, nh: u32, nkv: u32, hd: u32, state: u32, window: u32, scale: f32, r0: u32 };
 @group(0) @binding(0) var<storage, read>       at_q: array<f32>;
 @group(0) @binding(1) var<storage, read>       at_k: array<f32>;
 @group(0) @binding(2) var<storage, read>       at_v: array<f32>;
@@ -151,7 +151,7 @@ var<workgroup> at_red: array<f32, 128>;
 const NEG: f32 = -3.0e38;
 @compute @workgroup_size(128)
 fn ls_attn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let i = wid.x;
+    let i = at_p.r0 + wid.x;
     let hh = wid.y;
     let tid = lid.x;
     let hd = at_p.hd;
@@ -459,6 +459,11 @@ fn scratch(c: &Ctx, role: u8, bytes: usize, usage: wgpu::BufferUsages) -> wgpu::
     b
 }
 
+/// Query-row × key pairs per attention submission at d1's 16 query heads of
+/// 128 dims: about one second on an Arc Pro B50, well inside the 5 s xe job
+/// watchdog.
+const ATTN_PAIRS_PER_SUBMIT: usize = 1 << 25;
+
 /// The final-normed hidden rows `[t, hidden]` of `rows` under d1's mask
 /// and, with `head`, the logits of its rows; None when the stack or a
 /// weight is outside these kernels.
@@ -621,10 +626,6 @@ pub(crate) fn forward(
         pass.dispatch_workgroups(x, y, 1);
     };
     let rms_u = unif(&[hs as u32, d.gemma as u32, d.eps.to_bits(), 0]);
-    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("d1-set"),
-    });
-    let _merge_guard = PassMergeGuard::new(&enc);
     let rms = |enc: &mut wgpu::CommandEncoder, x: &wgpu::Buffer, w: &[f32], o: &wgpu::Buffer| {
         go(enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[x, &stor(w), o, &rms_u]), t as u32, 1);
     };
@@ -634,6 +635,10 @@ pub(crate) fn forward(
         go(enc, &p.norm_add.p, &bg(&p.norm_add.l, &[&h_b, dl, &wb, &u]), t as u32, 1);
     };
     for (l, pr) in layers.iter().zip(&preps) {
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("d1-set-layer"),
+        });
+        let mut merge_guard = PassMergeGuard::new(&enc);
         rms(&mut enc, &h_b, l.input_norm, &n_b);
         match &l.mixer {
             SetMixer::Conv { taps, kernel, .. } => {
@@ -682,23 +687,44 @@ pub(crate) fn forward(
                         t as u32,
                     );
                 }
-                let u = unif(&[
-                    t as u32,
-                    d.nh as u32,
-                    *nkv as u32,
-                    d.hd as u32,
-                    state as u32,
-                    window.unwrap_or(0) as u32,
-                    d.scale.to_bits(),
-                    0,
-                ]);
-                go(
-                    &mut enc,
-                    &p.attn.p,
-                    &bg(&p.attn.l, &[&x_b, &k_b, &v_b, &a_b, &g_b, &u]),
-                    t as u32,
-                    d.nh as u32,
-                );
+                let keys = window.map_or(t, |w| w.min(t));
+                let block = (ATTN_PAIRS_PER_SUBMIT / keys).clamp(1, t);
+                let mut r0 = 0;
+                while r0 < t {
+                    drop(merge_guard);
+                    submit(c, finish_enc(enc));
+                    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                    enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("d1-set-attn"),
+                    });
+                    merge_guard = PassMergeGuard::new(&enc);
+                    let span = block.min(t - r0);
+                    let u = unif(&[
+                        t as u32,
+                        d.nh as u32,
+                        *nkv as u32,
+                        d.hd as u32,
+                        state as u32,
+                        window.unwrap_or(0) as u32,
+                        d.scale.to_bits(),
+                        r0 as u32,
+                    ]);
+                    go(
+                        &mut enc,
+                        &p.attn.p,
+                        &bg(&p.attn.l, &[&x_b, &k_b, &v_b, &a_b, &g_b, &u]),
+                        span as u32,
+                        d.nh as u32,
+                    );
+                    r0 += span;
+                }
+                drop(merge_guard);
+                submit(c, finish_enc(enc));
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("d1-set-layer"),
+                });
+                merge_guard = PassMergeGuard::new(&enc);
                 if let Some(gw) = head_gate {
                     let u = unif(&[d.nh as u32, d.hd as u32, hs as u32, 0]);
                     go(
@@ -723,7 +749,14 @@ pub(crate) fn forward(
         go(&mut enc, &p.silu_mul.p, &bg(&p.silu_mul.l, &[&x_b, &u_b, &a_b, &u]), groups, 1);
         mm(c, &mut enc, &pr.ffn[2], &a_b, &d_b, t);
         norm_add(&mut enc, &d_b, l.ffn_out_norm);
+        drop(merge_guard);
+        submit(c, finish_enc(enc));
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("d1-set"),
+    });
+    let _merge_guard = PassMergeGuard::new(&enc);
     rms(&mut enc, &h_b, final_norm, &n_b);
     let mut out = vec![0f32; t * hs];
     let Some((w, idx)) = &head else {
