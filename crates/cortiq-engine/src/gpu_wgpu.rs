@@ -21207,6 +21207,21 @@ fn init(dev: usize) -> Result<Ctx, String> {
         && adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS)
         && std::env::var("CMF_SPV").as_deref() != Ok("0");
     SPV_OK.store(want_spv, std::sync::atomic::Ordering::Relaxed);
+    let want_coop816 = want_spv
+        && (8..=32).contains(&adapter_info.subgroup_min_size)
+        && (8..=32).contains(&adapter_info.subgroup_max_size)
+        && adapter.features().contains(
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
+        )
+        && coop_env.as_deref() != Some("0")
+        && adapter.cooperative_matrix_properties().iter().any(|c| {
+            c.m_size == 8
+                && c.n_size == 16
+                && c.k_size == 16
+                && c.ab_type == wgpu::CooperativeScalarType::F16
+                && c.cr_type == wgpu::CooperativeScalarType::F32
+        });
+    COOP816_OK.store(want_coop816, std::sync::atomic::Ordering::Relaxed);
     // Exact-size placement of the big buffers. wgpu's default hint
     // ("Performance") sub-allocates device memory in 128-256 MiB blocks: a
     // 143 MiB packed expert plane takes a block of its own and strands the
@@ -21227,7 +21242,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::Features::SUBGROUP
         } else {
             wgpu::Features::empty()
-        } | if want_coop || want_coop8 {
+        } | if want_coop || want_coop8 || want_coop816 {
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
         } else {
             wgpu::Features::empty()
@@ -21252,7 +21267,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         // without it `request_device` fails outright rather than dropping
         // the feature — which is how asking for cooperative matrices took
         // the whole device down and every op with it.
-        experimental_features: if want_coop || want_coop8 {
+        experimental_features: if want_coop || want_coop8 || want_coop816 {
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         } else {
             wgpu::ExperimentalFeatures::disabled()
@@ -47585,6 +47600,9 @@ pub(crate) fn pco() -> wgpu::PipelineCompilationOptions<'static> {
 static COOP_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Apple's 8×8×8 f16→f32 cooperative matrices (Metal), where 16×16 is absent.
 static COOP8_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Xe2's 8×16×16 f16→f32 cooperative matrices, reached through SPIR-V
+/// passthrough because WGSL only names 8×8 and 16×16.
+static COOP816_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Vulkan SPIR-V passthrough: hand-written GLSL kernels (`gpu_wgpu/*.comp`).
 static SPV_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
