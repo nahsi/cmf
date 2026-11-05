@@ -763,7 +763,9 @@ pub(crate) fn forward(
         scratch(c, 12, q, U::STORAGE);
         scratch(c, 13, q / 32 * 4, U::STORAGE);
     }
-    let kv16 = attn816(c).map(|_| {
+    let coop_shape = |nkv: usize| d.hd == 128 && d.nh == 4 * nkv;
+    let any_coop = layers.iter().any(|l| matches!(l.mixer, SetMixer::Attn { nkv, .. } if coop_shape(nkv)));
+    let kv16 = attn816(c).filter(|_| any_coop).map(|_| {
         let bytes = (t + KV_PAD) * kv_max * 2;
         (scratch(c, 19, bytes, U::STORAGE), scratch(c, 20, bytes, U::STORAGE))
     });
@@ -863,7 +865,7 @@ pub(crate) fn forward(
                         t as u32,
                     );
                 }
-                let coop_attn = (d.hd == 128 && d.nh == 4 * *nkv).then(|| attn816(c).zip(kv16.as_ref())).flatten();
+                let coop_attn = coop_shape(*nkv).then(|| attn816(c).zip(kv16.as_ref())).flatten();
                 if let Some(((half, _), (k16, v16))) = coop_attn {
                     let (n, total) = ((t * nkv * d.hd / 2) as u32, ((t + KV_PAD) * nkv * d.hd / 2) as u32);
                     let groups = total.div_ceil(256).min(65535);

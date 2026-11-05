@@ -107,16 +107,14 @@ void main() {
         khi = min(p.t, q0 + QB);
     }
 
-    // Subgroup sg owns output tiles [sg*otps, (sg+1)*otps) and score tiles
-    // [sg*stps, (sg+1)*stps), row-band major, so an A tile is loaded once
-    // per band.
+    // Subgroup sg owns output tiles [sg*otps, (sg+1)*otps), row-band major,
+    // so a P tile is loaded once per band, and score tile sg: 16 or 32
+    // subgroups (SIMD32 or SIMD16) cover the 16 score tiles.
     const uint otps = OT / nsg;
     coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[NACC];
     [[unroll]] for (uint i = 0; i < NACC; i++) {
         acc[i] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
     }
-    const uint stps = max(ST / nsg, 1u);
-    const bool sact = sg * stps < ST;
 
     const uint sr = tid / LPR;
     const uint sc0 = (tid % LPR) * CPL;
@@ -127,10 +125,10 @@ void main() {
         if (tid == 0) {
             resc = 0;
         }
-        if (sact) {
+        if (sg < ST) {
             coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> s =
                 coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0);
-            const uint ti = sg * stps;
+            const uint ti = sg;
             const uint tn = ti % (BC / 16);
             [[unroll]] for (uint d0 = 0; d0 < HD; d0 += 16) {
                 coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> a;

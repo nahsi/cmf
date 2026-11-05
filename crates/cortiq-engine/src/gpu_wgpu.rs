@@ -21207,6 +21207,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         && adapter.features().contains(wgpu::Features::PASSTHROUGH_SHADERS)
         && std::env::var("CMF_SPV").as_deref() != Ok("0");
     SPV_OK.store(want_spv, std::sync::atomic::Ordering::Relaxed);
+    // `d1_attn_coop` splits its tiles over 16 or 32 subgroups of 512 lanes:
+    // SIMD8 would need more accumulators and scratch than it holds.
     let want_coop816 = want_spv
         && (16..=32).contains(&adapter_info.subgroup_min_size)
         && (16..=32).contains(&adapter_info.subgroup_max_size)
