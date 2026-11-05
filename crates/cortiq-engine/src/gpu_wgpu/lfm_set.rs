@@ -482,15 +482,22 @@ fn q8_dp4a(c: &Ctx) -> Option<&'static (Spv, Spv)> {
 }
 
 /// d1 attention (set mask or sliding window) on Xe2's 8×16×16 cooperative
-/// matrices: `d1_attn_coop`, 16 queries × 4 heads sharing a KV head per
-/// workgroup, for 128-dim heads in groups of four.
-fn attn816(c: &Ctx) -> Option<&'static Spv> {
-    static PIPE: std::sync::OnceLock<Option<Spv>> = std::sync::OnceLock::new();
-    PIPE.get_or_init(|| {
-        spv_pipe(c, &super::COOP816_OK, "d1-set-attn", include_bytes!("d1_attn_coop.spv"), 128, &[RO, RO, RO, RW, RO, UNI])
-    })
-    .as_ref()
+/// matrices in one pass over the keys: `d1_attn_coop`, 16 queries × 4 heads
+/// sharing a KV head per workgroup, for 128-dim heads in groups of four,
+/// reading the f16 K/V `d1_kv_half` writes.
+fn attn816(c: &Ctx) -> Option<&'static (Spv, Spv)> {
+    static PIPES: std::sync::OnceLock<Option<(Spv, Spv)>> = std::sync::OnceLock::new();
+    PIPES
+        .get_or_init(|| {
+            let half = spv_pipe(c, &super::COOP816_OK, "d1-kv-half", include_bytes!("d1_kv_half.spv"), 256, &[RO, RO, RW, RW, UNI])?;
+            let attn = spv_pipe(c, &super::COOP816_OK, "d1-set-attn", include_bytes!("d1_attn_coop.spv"), 512, &[RO, RO, RO, RW, RO, UNI])?;
+            Some((half, attn))
+        })
+        .as_ref()
 }
+
+/// Key rows of zeros past t in the f16 K/V, one attention block.
+const KV_PAD: usize = 32;
 
 /// y[k][rows] = x[k][cols] · Wᵀ through the batch graph's kernels.
 fn mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, w: &Proj, xs: &wgpu::Buffer, y: &wgpu::Buffer, k: usize) {
@@ -756,6 +763,10 @@ pub(crate) fn forward(
         scratch(c, 12, q, U::STORAGE);
         scratch(c, 13, q / 32 * 4, U::STORAGE);
     }
+    let kv16 = attn816(c).map(|_| {
+        let bytes = (t + KV_PAD) * kv_max * 2;
+        (scratch(c, 19, bytes, U::STORAGE), scratch(c, 20, bytes, U::STORAGE))
+    });
     let head_bufs = head.as_ref().map(|(w, idx)| {
         let bytes = idx.len() * w.rows * 4;
         (scratch(c, 11, bytes, st), scratch(c, 18, bytes, U::MAP_READ | U::COPY_DST))
@@ -852,7 +863,21 @@ pub(crate) fn forward(
                         t as u32,
                     );
                 }
-                let coop_attn = if d.hd == 128 && d.nh == 4 * *nkv { attn816(c) } else { None };
+                let coop_attn = (d.hd == 128 && d.nh == 4 * *nkv).then(|| attn816(c).zip(kv16.as_ref())).flatten();
+                if let Some(((half, _), (k16, v16))) = coop_attn {
+                    let (n, total) = ((t * nkv * d.hd / 2) as u32, ((t + KV_PAD) * nkv * d.hd / 2) as u32);
+                    let groups = total.div_ceil(256).min(65535);
+                    let u = unif(&[n, total, groups * 256, 0]);
+                    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &half.layout,
+                        entries: &[bind_buf(0, &k_b), bind_buf(1, &v_b), bind_buf(2, k16), bind_buf(3, v16), bind_buf(4, &u)],
+                    });
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&half.pipe);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
                 let keys = window.map_or(t, |w| w.min(t));
                 let mut block = (ATTN_PAIRS_PER_SUBMIT / keys).clamp(1, t);
                 if coop_attn.is_some() {
@@ -868,7 +893,7 @@ pub(crate) fn forward(
                     });
                     merge_guard = PassMergeGuard::new(&enc);
                     let span = block.min(t - r0);
-                    if let Some(cp) = coop_attn {
+                    if let Some(((_, cp), (k16, v16))) = coop_attn {
                         let u = unif(&[
                             t as u32,
                             d.nh as u32,
@@ -884,8 +909,8 @@ pub(crate) fn forward(
                             layout: &cp.layout,
                             entries: &[
                                 bind_buf(0, &x_b),
-                                bind_buf(1, &k_b),
-                                bind_buf(2, &v_b),
+                                bind_buf(1, k16),
+                                bind_buf(2, v16),
                                 bind_buf(3, &a_b),
                                 bind_buf(4, &g_b),
                                 bind_buf(5, &u),
