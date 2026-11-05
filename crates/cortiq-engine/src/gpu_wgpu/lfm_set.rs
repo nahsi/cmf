@@ -765,25 +765,6 @@ pub(crate) fn forward(
     }
     c.queue.write_buffer(&h_b, 0, bytemuck::cast_slice(rows));
     c.queue.write_buffer(&g_b, 0, bytemuck::cast_slice(group));
-    if let Some(r) = c.device.generate_allocator_report() {
-        let mut a: Vec<_> = r.allocations.iter().map(|x| (x.size, x.name.clone())).collect();
-        a.sort_by(|x, y| y.0.cmp(&x.0));
-        let mut by: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
-        for (s, n) in &a {
-            let e = by.entry(n.clone()).or_default();
-            e.0 += s;
-            e.1 += 1;
-        }
-        let mut byv: Vec<_> = by.into_iter().collect();
-        byv.sort_by(|x, y| y.1.0.cmp(&x.1.0));
-        tracing::info!(
-            "PRIMESTACK-MEM t={t} allocated={} reserved={} n={} top={:?}",
-            r.total_allocated_bytes >> 20,
-            r.total_reserved_bytes >> 20,
-            a.len(),
-            byv.iter().take(15).map(|(n, (s, k))| format!("{n}:{}MiB/{k}", s >> 20)).collect::<Vec<_>>()
-        );
-    }
 
     let stor = |data: &[f32]| const_buf(c, bytemuck::cast_slice(data));
     let dummy = stor(&[0f32; 4]);
