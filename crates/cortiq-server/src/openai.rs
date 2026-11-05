@@ -1,6 +1,6 @@
 //! OpenAI-compatible API endpoints, backed by the real inference
 //! pipeline. Generation runs in `spawn_blocking` behind a Mutex — a
-//! panic inside the pipeline becomes a 500, never a dead process.
+//! task panic becomes a 500; unexpected GPU device loss terminates the process.
 
 use crate::AppState;
 use crate::streaming::{self, ChatStream};
