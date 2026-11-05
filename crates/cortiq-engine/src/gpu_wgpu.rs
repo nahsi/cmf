@@ -21267,6 +21267,12 @@ fn init(dev: usize) -> Result<Ctx, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("request_device: {e}"))?;
+    device.set_device_lost_callback(|reason, message| {
+        if reason != wgpu::DeviceLostReason::Destroyed {
+            tracing::error!(?reason, %message, "GPU device lost; terminating process");
+            std::process::abort();
+        }
+    });
     // Every shader-module and pipeline validation error below must fail
     // init: an invalid pipeline silently turns its dispatches into
     // no-ops and the graph decodes garbage (seen on phones before this

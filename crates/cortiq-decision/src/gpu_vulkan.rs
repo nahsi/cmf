@@ -73,6 +73,12 @@ impl ContextGpu {
             ..Default::default()
         }))
         .context("create decision Vulkan device")?;
+        device.set_device_lost_callback(|reason, message| {
+            if reason != wgpu::DeviceLostReason::Destroyed {
+                tracing::error!(?reason, %message, "decision GPU device lost; terminating process");
+                std::process::abort();
+            }
+        });
         let error = Arc::new(parking_lot::Mutex::new(None));
         let handler_error = error.clone();
         device.on_uncaptured_error(Arc::new(move |e| {
